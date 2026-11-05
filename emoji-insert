@@ -1,0 +1,620 @@
+#!/usr/bin/python3 -P
+"""emoji-insert: pick an emoji from a dark grid and insert it into the focused window.
+
+For KDE Plasma on Wayland. Type to search by name, arrows to move, Enter or click
+to insert, Esc to cancel. The bar at the bottom sets the skin tone and whether the
+previous clipboard is restored after inserting.
+
+Needs:  pyside6, wl-clipboard, ydotool (running ydotoold), optional: kdotool
+Data:   ~/.local/share/emoji-insert/emojis.tsv (create or refresh: emoji-insert --update-data)
+Config: ~/.config/emoji-insert/settings.json
+"""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+import traceback
+import urllib.request
+from pathlib import Path
+from typing import NamedTuple
+
+
+def notify(message):
+    print(f"emoji-insert: {message}", file=sys.stderr)
+    try:
+        subprocess.run(["notify-send", "emoji-insert", message], timeout=5,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+try:
+    from PySide6.QtCore import QEvent, Qt
+    from PySide6.QtGui import QColor, QFont, QPalette
+    from PySide6.QtWidgets import (
+        QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QHBoxLayout, QHeaderView,
+        QLineEdit, QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    )
+except ImportError as err:
+    notify(f"Can't load PySide6: {err}")
+    sys.exit(1)
+
+DATA_DIR = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share") / "emoji-insert"
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "emoji-insert"
+EMOJIS = DATA_DIR / "emojis.tsv"
+LEGACY_EMOJIS = DATA_DIR / "emojis.txt"  # Hand-kept list; its extra search keywords are merged in
+RECENT = DATA_DIR / "recent.txt"
+SETTINGS = CONFIG_DIR / "settings.json"
+EMOJI_TEST_URL = "https://unicode.org/Public/emoji/latest/emoji-test.txt"
+
+RECENT_MAX = 30
+FOCUS_DELAY = 0.15  # Let focus return to the original window before pasting
+RESTORE_DELAY = 0.3  # Let the target window read the emoji before restoring the clipboard
+
+# Window classes that need Ctrl+Shift+V instead of Ctrl+V (only used if kdotool is installed)
+TERMINALS = {
+    "konsole", "kitty", "alacritty", "foot", "wezterm", "ghostty", "yakuake",
+    "org.kde.konsole", "org.wezfurlong.wezterm", "com.mitchellh.ghostty",
+}
+PASSWORD_HINT = "x-kde-passwordManagerHint"
+VS16 = "️"
+TONE_MODIFIERS = "\U0001F3FB\U0001F3FC\U0001F3FD\U0001F3FE\U0001F3FF"
+
+COLS = 10
+CELL = 46
+PAGE_ROWS = 8
+KEY_ROLE = Qt.UserRole
+
+BG, SURFACE, BORDER = "#16181d", "#22252c", "#343842"
+TEXT, MUTED, HOVER, SELECTED = "#e6e8ec", "#8b909c", "#2c3039", "#3d5a99"
+
+STYLE = f"""
+QWidget#picker {{ background: {BG}; border: 1px solid {BORDER}; }}
+QLineEdit {{
+    background: {SURFACE}; color: {TEXT}; border: 1px solid {BORDER};
+    border-radius: 6px; padding: 7px 10px; font-size: 14px;
+    selection-background-color: {SELECTED};
+}}
+QLineEdit:focus {{ border-color: {SELECTED}; }}
+QTableWidget {{ background: {BG}; border: none; outline: none; }}
+QTableWidget::item {{ border-radius: 6px; }}
+QTableWidget::item:hover:enabled {{ background: {HOVER}; }}
+QTableWidget::item:selected:enabled {{ background: {SELECTED}; }}
+QScrollBar:vertical {{ background: {BG}; width: 10px; margin: 0; }}
+QScrollBar::handle:vertical {{ background: {BORDER}; border-radius: 5px; min-height: 30px; }}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background: none; }}
+QCheckBox {{ color: {MUTED}; font-size: 12px; spacing: 7px; }}
+QCheckBox:hover, QCheckBox:checked {{ color: {TEXT}; }}
+QCheckBox::indicator {{
+    width: 26px; height: 14px; border-radius: 7px;
+    background: {SURFACE}; border: 1px solid {BORDER};
+}}
+QCheckBox::indicator:checked {{ background: {SELECTED}; border-color: {SELECTED}; }}
+QPushButton {{ background: transparent; border: none; border-radius: 5px; padding: 0; }}
+QPushButton:hover {{ background: {HOVER}; }}
+QPushButton:checked {{ background: {SELECTED}; }}
+"""
+
+
+# --- Data -------------------------------------------------------------------
+
+class Entry(NamedTuple):
+    group: str
+    emoji: str
+    name: str
+    keywords: str
+    tones: tuple  # The five skin tone variants, lightest first, or empty
+
+    def shown(self, tone):
+        """The emoji in skin tone `tone` (0 = default, 1-5 = lightest to darkest)."""
+        return self.tones[tone - 1] if tone and self.tones else self.emoji
+
+    def words(self):
+        return re.findall(r"\w+", f"{self.name} {self.keywords}".lower())
+
+
+def emoji_key(emoji):
+    return emoji.replace(VS16, "")
+
+
+def atomic_write(path, text):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent,
+                                     prefix=f".{path.name}.", delete=False) as tmp:
+        tmp.write(text)
+    os.chmod(tmp.name, 0o644)
+    os.replace(tmp.name, path)
+
+
+def load_entries(path):
+    entries = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            if line.startswith("#") or not line.strip():
+                continue
+            group, emoji, name, keywords, tones = line.rstrip("\n").split("\t")
+            entries.append(Entry(group, emoji, name, keywords, tuple(tones.split())))
+    return entries
+
+
+def load_recent(path):
+    """Recently used emoji keys, newest first. Lines may carry a trailing name (older format)."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            keys = [emoji_key(line.split()[0]) for line in f if line.strip()]
+    except FileNotFoundError:
+        return []
+    return list(dict.fromkeys(keys))
+
+
+def save_recent(path, emoji):
+    key = emoji_key(emoji)
+    keys = [key] + [k for k in load_recent(path) if k != key]
+    atomic_write(path, "".join(f"{k}\n" for k in keys[:RECENT_MAX]))
+
+
+def load_settings(path):
+    settings = {"preserve_clipboard": False, "skin_tone": 0}
+    try:
+        saved = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return settings
+    if isinstance(saved, dict):
+        if isinstance(saved.get("preserve_clipboard"), bool):
+            settings["preserve_clipboard"] = saved["preserve_clipboard"]
+        if saved.get("skin_tone") in range(6):
+            settings["skin_tone"] = saved["skin_tone"]
+    return settings
+
+
+def save_settings(path, settings):
+    try:
+        atomic_write(path, json.dumps(settings, indent=2) + "\n")
+    except OSError as err:
+        notify(f"Couldn't save settings: {err}")
+
+
+def legacy_keywords(path):
+    """Search words from the old emojis.txt ("😀 grinning face  (keywords)"), by emoji key."""
+    keywords = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                emoji, _, text = line.strip().partition(" ")
+                if emoji:
+                    keywords[emoji_key(emoji)] = re.findall(r"\w+", text.lower())
+    except FileNotFoundError:
+        pass
+    return keywords
+
+
+def parse_emoji_test(text, extra_words):
+    """Turn Unicode's emoji-test.txt into TSV rows, folding skin tones into their base emoji."""
+    pattern = re.compile(r"^([0-9A-F ]+?)\s*;\s*fully-qualified\s*#\s*\S+\s+E[\d.]+\s+(.+)$")
+    rows, by_key = [], {}
+    group, version = None, "?"
+    for line in text.splitlines():
+        if line.startswith("# group:"):
+            group = line.split(":", 1)[1].strip()
+        elif line.startswith("# Version:"):
+            version = line.split(":", 1)[1].strip()
+        match = pattern.match(line)
+        if not match or group == "Component":
+            continue
+        emoji = "".join(chr(int(cp, 16)) for cp in match[1].split())
+        tones = {c for c in emoji if c in TONE_MODIFIERS}
+        base = "".join(c for c in emoji if c not in TONE_MODIFIERS and c != VS16)
+        if not tones:
+            name = match[2].lower()
+            words = dict.fromkeys(extra_words.get(base, []))
+            keywords = " ".join(w for w in words if w not in re.findall(r"\w+", name))
+            row = {"group": group, "emoji": emoji, "name": name, "keywords": keywords, "tones": {}}
+            rows.append(row)
+            by_key[base] = row
+        elif len(tones) == 1 and base in by_key:  # Mixed-tone pairs don't fit a single tone setting
+            by_key[base]["tones"][tones.pop()] = emoji
+    return version, rows
+
+
+def update_data():
+    print(f"Downloading {EMOJI_TEST_URL}")
+    request = urllib.request.Request(EMOJI_TEST_URL, headers={"User-Agent": "emoji-insert"})
+    with urllib.request.urlopen(request, timeout=30) as response:
+        text = response.read().decode("utf-8")
+    version, rows = parse_emoji_test(text, legacy_keywords(LEGACY_EMOJIS))
+    if len(rows) < 1000:
+        raise ValueError(f"Only {len(rows)} emojis found in {EMOJI_TEST_URL}; keeping current data")
+    lines = [f"# Unicode Emoji {version}. Generated by emoji-insert --update-data\n"]
+    for row in rows:
+        tones = " ".join(row["tones"][t] for t in TONE_MODIFIERS) if len(row["tones"]) == 5 else ""
+        lines.append("\t".join((row["group"], row["emoji"], row["name"], row["keywords"], tones)) + "\n")
+    atomic_write(EMOJIS, "".join(lines))
+    print(f"Wrote {len(rows)} emojis (Unicode Emoji {version}) to {EMOJIS}")
+
+
+# --- Picker -----------------------------------------------------------------
+
+def dark_palette():
+    pal = QPalette()
+    for role, color in {
+        QPalette.Window: BG, QPalette.Base: BG, QPalette.AlternateBase: SURFACE,
+        QPalette.Button: SURFACE, QPalette.Text: TEXT, QPalette.WindowText: TEXT,
+        QPalette.ButtonText: TEXT, QPalette.PlaceholderText: MUTED,
+        QPalette.Highlight: SELECTED, QPalette.HighlightedText: TEXT,
+    }.items():
+        pal.setColor(role, QColor(color))
+    return pal
+
+
+class Picker(QWidget):
+    def __init__(self, entries, recent_keys, settings, settings_path):
+        super().__init__(None, Qt.Window | Qt.FramelessWindowHint)
+        self.entries = entries
+        self.by_key = {emoji_key(e.emoji): e for e in entries}
+        self.words = {emoji_key(e.emoji): e.words() for e in entries}
+        self.recent = [self.by_key[k] for k in recent_keys if k in self.by_key]
+        self.settings = settings
+        self.settings_path = settings_path
+        self.picked = None  # The chosen Entry
+        self.was_active = False
+
+        self.setObjectName("picker")
+        self.setWindowTitle("Emoji")
+
+        self.search = QLineEdit(placeholderText="Search emoji…")
+        self.search.installEventFilter(self)
+        self.search.textChanged.connect(self.show_matches)
+
+        self.emoji_font = QFont("Noto Color Emoji")
+        self.emoji_font.setPixelSize(CELL - 18)
+        self.header_font = QFont()
+        self.header_font.setPixelSize(12)
+        self.header_font.setBold(True)
+
+        table = self.table = QTableWidget(0, COLS)
+        table.setFont(self.emoji_font)
+        table.setFocusPolicy(Qt.NoFocus)
+        table.setShowGrid(False)
+        table.setMouseTracking(True)
+        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        table.setSelectionMode(QAbstractItemView.SingleSelection)
+        table.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        table.horizontalHeader().hide()
+        table.verticalHeader().hide()
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.Fixed)
+        table.horizontalHeader().setDefaultSectionSize(CELL)
+        table.verticalHeader().setSectionResizeMode(QHeaderView.Fixed)
+        table.verticalHeader().setDefaultSectionSize(CELL)
+        table.itemClicked.connect(self.pick)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 10)
+        layout.setSpacing(10)
+        layout.addWidget(self.search)
+        layout.addWidget(table)
+        layout.addLayout(self.build_footer())
+        self.setFixedSize(COLS * CELL + 10 + 2 * 12 + 2, 530)
+
+        self.show_matches("")
+
+    def build_footer(self):
+        self.preserve = QCheckBox("Preserve Clipboard")
+        self.preserve.setFocusPolicy(Qt.NoFocus)  # Typing must keep going to the search box
+        self.preserve.setChecked(self.settings["preserve_clipboard"])
+        self.preserve.toggled.connect(self.set_preserve)
+
+        footer = QHBoxLayout()
+        footer.addWidget(self.preserve)
+        footer.addStretch()
+
+        swatch_font = QFont("Noto Color Emoji")
+        swatch_font.setPixelSize(16)
+        self.tone_buttons = QButtonGroup(self)
+        for tone, swatch in enumerate(("✋", *(f"✋{m}" for m in TONE_MODIFIERS))):
+            button = QPushButton(swatch)
+            button.setFont(swatch_font)
+            button.setFixedSize(26, 26)
+            button.setCheckable(True)
+            button.setChecked(tone == self.settings["skin_tone"])
+            button.setFocusPolicy(Qt.NoFocus)
+            self.tone_buttons.addButton(button, tone)
+            footer.addWidget(button)
+        self.tone_buttons.idClicked.connect(self.set_tone)
+        return footer
+
+    def set_preserve(self, checked):
+        self.settings["preserve_clipboard"] = checked
+        save_settings(self.settings_path, self.settings)
+
+    def set_tone(self, tone):
+        self.settings["skin_tone"] = tone
+        save_settings(self.settings_path, self.settings)
+        table = self.table
+        for row in range(table.rowCount()):
+            for col in range(COLS):
+                item = table.item(row, col)
+                if item and item.data(KEY_ROLE):
+                    item.setText(self.by_key[item.data(KEY_ROLE)].shown(tone))
+
+    def show_matches(self, text):
+        terms = text.lower().split()
+        if terms:
+            # Match word starts: with names hidden, "cat" finding "application" looks random
+            recent = {emoji_key(e.emoji) for e in self.recent}
+            others = [e for e in self.entries if emoji_key(e.emoji) not in recent]
+            matches = [e for e in self.recent + others
+                       if all(any(word.startswith(term) for word in self.words[emoji_key(e.emoji)])
+                              for term in terms)]
+            self.fill([(None, matches)])
+        else:
+            sections = {"Recent": self.recent}
+            for entry in self.entries:
+                sections.setdefault(entry.group, []).append(entry)
+            self.fill(list(sections.items()))
+
+    def fill(self, sections):
+        table = self.table
+        table.setUpdatesEnabled(False)
+        table.clearSpans()
+        table.setRowCount(0)
+        first = None
+        row = 0
+        for title, entries in sections:
+            if not entries:
+                continue
+            if title:
+                table.insertRow(row)
+                table.setRowHeight(row, 28)
+                table.setSpan(row, 0, 1, COLS)
+                table.setItem(row, 0, self.header_item(title))
+                row += 1
+            rows = (len(entries) + COLS - 1) // COLS
+            table.setRowCount(row + rows)
+            for i in range(rows * COLS):
+                r, c = row + i // COLS, i % COLS
+                table.setItem(r, c, self.emoji_item(entries[i] if i < len(entries) else None))
+                if first is None:
+                    first = (r, c)
+            row += rows
+        if first:
+            table.setCurrentCell(*first)
+        table.scrollToTop()
+        table.setUpdatesEnabled(True)
+
+    def header_item(self, title):
+        item = QTableWidgetItem(title)
+        item.setFlags(Qt.NoItemFlags)
+        item.setFont(self.header_font)
+        item.setForeground(QColor(MUTED))
+        item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        return item
+
+    def emoji_item(self, entry):
+        if entry is None:  # Blank cell padding out a section's last row
+            item = QTableWidgetItem()
+            item.setFlags(Qt.NoItemFlags)
+            return item
+        item = QTableWidgetItem(entry.shown(self.settings["skin_tone"]))
+        item.setData(KEY_ROLE, emoji_key(entry.emoji))
+        item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+        item.setTextAlignment(Qt.AlignCenter)
+        return item
+
+    def has_emoji(self, row, col):
+        item = self.table.item(row, col)
+        return bool(item and item.data(KEY_ROLE))
+
+    def navigate(self, key):
+        # Qt's own cursor movement stops at blank cells and group headers
+        table = self.table
+        row, col = table.currentRow(), table.currentColumn()
+        if row < 0:
+            return
+        if key in (Qt.Key_Left, Qt.Key_Right):
+            step = 1 if key == Qt.Key_Right else -1
+            i = row * COLS + col + step
+            while 0 <= i < table.rowCount() * COLS:
+                if self.has_emoji(i // COLS, i % COLS):
+                    table.setCurrentCell(i // COLS, i % COLS)
+                    break
+                i += step
+        else:
+            step = 1 if key in (Qt.Key_Down, Qt.Key_PageDown) else -1
+            moves = PAGE_ROWS if key in (Qt.Key_PageUp, Qt.Key_PageDown) else 1
+            target = None
+            r = row + step
+            while 0 <= r < table.rowCount() and moves:
+                # A short last row lands on its last emoji; a header has none, so is skipped
+                c = next((c for c in range(col, -1, -1) if self.has_emoji(r, c)), None)
+                if c is not None:
+                    target = (r, c)
+                    moves -= 1
+                r += step
+            if target:
+                table.setCurrentCell(*target)
+        if table.currentRow() <= 1:  # Keep the first group's header in view
+            table.scrollToTop()
+
+    def pick(self, item):
+        key = item.data(KEY_ROLE) if item else None
+        if key:
+            self.picked = self.by_key[key]
+            self.close()
+
+    def eventFilter(self, obj, event):
+        # The search box keeps focus so typing always searches; navigation goes to the grid
+        if event.type() == QEvent.KeyPress:
+            key = event.key()
+            if key in (Qt.Key_Return, Qt.Key_Enter):
+                self.pick(self.table.currentItem())
+                return True
+            if key == Qt.Key_Escape:
+                self.close()
+                return True
+            if key in (Qt.Key_Up, Qt.Key_Down, Qt.Key_Left, Qt.Key_Right,
+                       Qt.Key_PageUp, Qt.Key_PageDown):
+                self.navigate(key)
+                return True
+        return super().eventFilter(obj, event)
+
+    def changeEvent(self, event):
+        # Clicking another window cancels, like a launcher
+        if event.type() == QEvent.ActivationChange:
+            if self.isActiveWindow():
+                self.was_active = True
+            elif self.was_active:
+                self.close()
+        super().changeEvent(event)
+
+
+def run_picker(entries, recent_keys, settings):
+    """Show the picker. Returns the chosen Entry, or None if cancelled."""
+    app = QApplication(sys.argv[:1])
+    app.setStyle("Fusion")
+    app.setPalette(dark_palette())
+    app.setStyleSheet(STYLE)
+    app.setDesktopFileName("net.local.emoji-insert")
+    picker = Picker(entries, recent_keys, settings, SETTINGS)
+    picker.show()
+    picker.search.setFocus()
+    app.exec()
+    app.processEvents()  # Make sure the window is really gone before anything is pasted
+    return picker.picked
+
+
+# --- Clipboard and paste ----------------------------------------------------
+
+class Clip(NamedTuple):
+    mime: str
+    data: bytes
+    sensitive: bool
+
+
+def run_ok(command, **kwargs):
+    try:
+        return subprocess.run(command, timeout=5, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL, **kwargs).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def best_mime(types):
+    """wl-copy serves one format, so choose the one that pastes most usefully on its own."""
+    for mime in ("text/uri-list", "text/plain;charset=utf-8", "text/plain", "UTF8_STRING",
+                 "STRING", "TEXT", "image/png"):
+        if mime in types:
+            return mime
+    for mime in types:
+        if mime.startswith("image/"):
+            return mime
+    return next((mime for mime in types if mime != PASSWORD_HINT), None)
+
+
+def read_clipboard():
+    """The current clipboard contents, or None if it's empty or unreadable."""
+    try:
+        listed = subprocess.run(["wl-paste", "--list-types"], capture_output=True, timeout=2)
+        types = listed.stdout.decode("utf-8", "replace").split("\n") if listed.returncode == 0 else []
+        mime = best_mime([t for t in types if t])
+        if not mime:
+            return None
+        pasted = subprocess.run(["wl-paste", "--no-newline", "--type", mime],
+                                capture_output=True, timeout=2)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if pasted.returncode != 0 or not pasted.stdout:
+        return None
+    return Clip(mime, pasted.stdout, PASSWORD_HINT in types)
+
+
+def write_clipboard(data, mime=None, sensitive=False):
+    command = ["wl-copy"]
+    if mime:
+        command += ["--type", mime]
+    if sensitive:  # Keeps it out of Klipper's history
+        command.append("--sensitive")
+    # No pipes on stdout/stderr: wl-copy stays running in the background and would hold them open
+    return run_ok(command, input=data)
+
+
+def window_class():
+    try:
+        result = subprocess.run(["kdotool", "getactivewindow", "getwindowclassname"],
+                                capture_output=True, text=True, timeout=1)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return result.stdout.strip()
+
+
+def send_paste(win_class):
+    # 29=Ctrl 42=Shift 47=V
+    if win_class in TERMINALS:
+        keys = ["29:1", "42:1", "47:1", "47:0", "42:0", "29:0"]
+    else:
+        keys = ["29:1", "47:1", "47:0", "29:0"]
+    return run_ok(["ydotool", "key", *keys])
+
+
+def insert(emoji, win_class, preserve):
+    saved = read_clipboard() if preserve else None
+    # When preserving, the emoji is only passing through, so keep it out of the history
+    if not write_clipboard(emoji.encode(), sensitive=preserve):
+        notify(f"Couldn't copy {emoji} to the clipboard. Is wl-clipboard installed?")
+        return 1
+    time.sleep(FOCUS_DELAY)
+    if not send_paste(win_class):
+        # Leave the emoji on the clipboard rather than restoring, so it isn't lost
+        notify(f"Couldn't paste automatically (is ydotoold running?). {emoji} is on the clipboard.")
+        return 1
+    if saved:
+        time.sleep(RESTORE_DELAY)
+        if not write_clipboard(saved.data, saved.mime, saved.sensitive):
+            notify("Couldn't restore the previous clipboard.")
+            return 1
+    return 0
+
+
+# --- Main -------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(description="Pick an emoji and insert it into the focused window.")
+    parser.add_argument("--update-data", action="store_true",
+                        help="download the latest emoji list from unicode.org and exit")
+    if parser.parse_args().update_data:
+        update_data()
+        return 0
+
+    if not EMOJIS.exists():
+        notify(f"Emoji list missing: {EMOJIS}. Run: emoji-insert --update-data")
+        return 1
+
+    # ydotool socket (Arch's user service puts it in $XDG_RUNTIME_DIR)
+    socket = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}") / ".ydotool_socket"
+    if not os.environ.get("YDOTOOL_SOCKET") and socket.is_socket():
+        os.environ["YDOTOOL_SOCKET"] = str(socket)
+
+    win_class = window_class()  # Before the picker takes focus
+    settings = load_settings(SETTINGS)
+    picked = run_picker(load_entries(EMOJIS), load_recent(RECENT), settings)
+    if picked is None:
+        return 0
+
+    save_recent(RECENT, picked.emoji)
+    return insert(picked.shown(settings["skin_tone"]), win_class, settings["preserve_clipboard"])
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as err:
+        traceback.print_exc()
+        notify(f"Failed: {err}")
+        sys.exit(1)
